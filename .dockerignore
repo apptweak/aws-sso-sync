@@ -1,0 +1,11 @@
+.git
+.bin
+dist
+internal/mocks
+coverage.out
+coverage.html
+Dockerfile
+.dockerignore
+.vscode
+.idea
+.DS_Store
