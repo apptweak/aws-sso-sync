@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/awslabs/ssosync/internal/config"
@@ -81,6 +82,23 @@ func TestGetGroupOperationsWithIgnore(t *testing.T) {
 
 	assert.Len(t, equals, 1)
 	assert.Equal(t, "Group In Both", equals[0].DisplayName)
+}
+
+func TestGetGroupOperationsIgnoreUsesDisplayNameWhenDescriptionIsNotEmail(t *testing.T) {
+	ignoreFn := func(name string) bool {
+		return strings.HasPrefix(name, "AWS") || name == "Readers"
+	}
+
+	awsGroups := []*interfaces.Group{
+		{DisplayName: "Readers", Description: "test readers"},
+		{DisplayName: "AWSAccountFactory", Description: "Read-only access to account factory in AWS Service Catalog for end users"},
+	}
+
+	add, delete, equals := getGroupOperations(awsGroups, nil, ignoreFn)
+
+	assert.Empty(t, add)
+	assert.Empty(t, delete)
+	assert.Empty(t, equals)
 }
 
 func TestGetUserOperationsWithIgnore(t *testing.T) {

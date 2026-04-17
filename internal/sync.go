@@ -1226,10 +1226,14 @@ func getAWSGroupKey(group *interfaces.Group) string {
 	if group == nil {
 		return ""
 	}
-	if group.Description != "" {
+	if isEmailLike(group.Description) {
 		return group.Description
 	}
 	return group.DisplayName
+}
+
+func isEmailLike(value string) bool {
+	return strings.Contains(value, "@") && !strings.ContainsAny(value, " \t\r\n")
 }
 
 func (s *syncGSuite) syncAWSGroupMetadata(awsGroup *interfaces.Group, googleGroup *admin.Group) error {
