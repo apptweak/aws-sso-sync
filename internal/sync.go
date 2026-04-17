@@ -858,7 +858,7 @@ func (s *syncGSuite) getGoogleGroupsAndUsers(queryGroups string, queryUsers stri
 	}
 
 	log.WithField("func", funcName).Debug("create gUsers")
-	gUsers := make([]*admin.User, 0)
+	gUsers = make([]*admin.User, 0)
 	for _, user := range gUniqUsers {
 		gUsers = append(gUsers, user)
 	}
