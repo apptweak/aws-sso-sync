@@ -17,7 +17,6 @@ package google
 
 import (
 	"context"
-	"errors"
 	"strings"
 
 	"golang.org/x/oauth2/google"
@@ -243,10 +242,6 @@ func (c *client) getGroups(query string) ([]*admin.Group, error) {
 		}); err != nil {
 			return nil, err
 		}
-		// Check we've got some users otherwise something is wrong.
-		if len(g) == 0 {
-			return nil, errors.New("google api return 0 groups?")
-		}
 		return g, err
 	}
 
@@ -263,9 +258,5 @@ func (c *client) getGroups(query string) ([]*admin.Group, error) {
 		}
 	}
 
-	// Check we've got some users otherwise something is wrong.
-	if len(g) == 0 {
-		return nil, errors.New("google api return 0 groups?")
-	}
 	return g, err
 }
