@@ -19,6 +19,7 @@ type Group struct {
 	ID          string   `json:"id,omitempty"`
 	Schemas     []string `json:"schemas"`
 	DisplayName string   `json:"displayName"`
+	Description string   `json:"description,omitempty"`
 	Members     []string `json:"members"`
 }
 

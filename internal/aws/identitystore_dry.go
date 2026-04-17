@@ -31,6 +31,11 @@ func (d *DryIdentityStore) CreateGroup(ctx context.Context, params *identitystor
 	}, nil
 }
 
+func (d *DryIdentityStore) UpdateGroup(ctx context.Context, params *identitystore.UpdateGroupInput, optFns ...func(*identitystore.Options)) (*identitystore.UpdateGroupOutput, error) {
+	log.WithField("groupId", *params.GroupId).Info("DRY RUN: Would update group")
+	return &identitystore.UpdateGroupOutput{}, nil
+}
+
 func (d *DryIdentityStore) CreateGroupMembership(ctx context.Context, params *identitystore.CreateGroupMembershipInput, optFns ...func(*identitystore.Options)) (*identitystore.CreateGroupMembershipOutput, error) {
 	log.WithFields(log.Fields{
 		"groupId": *params.GroupId,
