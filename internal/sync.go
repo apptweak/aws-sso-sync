@@ -34,6 +34,7 @@ import (
 	aws_sdk "github.com/aws/aws-sdk-go-v2/aws"
 	aws_config "github.com/aws/aws-sdk-go-v2/config"
 	aws_identitystore "github.com/aws/aws-sdk-go-v2/service/identitystore"
+	aws_identitystore_document "github.com/aws/aws-sdk-go-v2/service/identitystore/document"
 	identitystore_types "github.com/aws/aws-sdk-go-v2/service/identitystore/types"
 	log "github.com/sirupsen/logrus"
 	admin "google.golang.org/api/admin/directory/v1"
@@ -223,6 +224,16 @@ func (s *syncGSuite) SyncGroups(query string) error {
 		return err
 	}
 
+	awsGroups, err := s.GetGroups()
+	if err != nil {
+		return err
+	}
+
+	awsGroupsByKey := make(map[string]*interfaces.Group, len(awsGroups))
+	for _, existingGroup := range awsGroups {
+		awsGroupsByKey[getAWSGroupKey(existingGroup)] = existingGroup
+	}
+
 	correlatedGroups := make(map[string]*interfaces.Group)
 
 	for _, g := range googleGroups {
@@ -237,28 +248,33 @@ func (s *syncGSuite) SyncGroups(query string) error {
 		log.Debug("Check group")
 		var group *interfaces.Group
 
-		gg, err := s.aws.FindGroupByDisplayName(g.Email)
-		if err != nil && err != aws.ErrGroupNotFound {
-			return err
-		}
+		gg := awsGroupsByKey[g.Email]
 
 		if gg != nil {
 			log.Debug("Found group")
-			correlatedGroups[gg.DisplayName] = gg
+			if err := s.syncAWSGroupMetadata(gg, g); err != nil {
+				return err
+			}
+			correlatedGroups[getAWSGroupKey(gg)] = gg
 			group = gg
 		} else {
 			log.Info("Creating group in AWS")
-			newGroup := aws.NewGroup(g.Email)
-			createGroupOutput, err := identitystore.CreateGroup(ctx,
-				s.identityStore,
-				aws_sdk.String(s.cfg.IdentityStoreID),
-				aws_sdk.String(g.Email),
-			)
+			newGroup := &interfaces.Group{
+				Schemas:     []string{constants.SCIMSchemaGroup},
+				DisplayName: g.Name,
+				Description: g.Email,
+				Members:     []string{},
+			}
+			createGroupOutput, err := s.identityStore.CreateGroup(ctx, &aws_identitystore.CreateGroupInput{
+				IdentityStoreId: aws_sdk.String(s.cfg.IdentityStoreID),
+				DisplayName:     aws_sdk.String(g.Name),
+				Description:     aws_sdk.String(g.Email),
+			})
 			if err != nil {
 				return err
 			}
 			newGroup.ID = *createGroupOutput.GroupId
-			correlatedGroups[newGroup.DisplayName] = newGroup
+			correlatedGroups[getAWSGroupKey(newGroup)] = newGroup
 			group = newGroup
 		}
 
@@ -384,6 +400,10 @@ func (s *syncGSuite) SyncGroupsUsers(queryGroups string, queryUsers string) erro
 	// create list of changes by operations
 	addAWSUsers, delAWSUsers, updateAWSUsers, _ := getUserOperations(awsUsers, googleUsers, s.ignoreUser)
 	addAWSGroups, delAWSGroups, equalAWSGroups := getGroupOperations(awsGroups, googleGroups, s.ignoreGroup)
+	googleGroupsByEmail := make(map[string]*admin.Group, len(googleGroups))
+	for _, googleGroup := range googleGroups {
+		googleGroupsByEmail[googleGroup.Email] = googleGroup
+	}
 
 	log.Info("syncing changes")
 
@@ -438,19 +458,19 @@ func (s *syncGSuite) SyncGroupsUsers(queryGroups string, queryUsers string) erro
 		log := log.WithFields(log.Fields{"group": awsGroup.DisplayName})
 
 		log.Info("creating group")
-		newAwsGroup, err := identitystore.CreateGroup(
-			context.Background(),
-			s.identityStore,
-			&s.cfg.IdentityStoreID,
-			&awsGroup.DisplayName,
-		)
+		newAwsGroup, err := s.identityStore.CreateGroup(context.Background(), &aws_identitystore.CreateGroupInput{
+			IdentityStoreId: &s.cfg.IdentityStoreID,
+			DisplayName:     &awsGroup.DisplayName,
+			Description:     &awsGroup.Description,
+		})
 		if err != nil {
 			log.Error("creating group")
 			return err
 		}
 
 		// add members of the new group
-		for _, googleUser := range googleGroupsUsers[awsGroup.DisplayName] {
+		groupKey := getAWSGroupKey(awsGroup)
+		for _, googleUser := range googleGroupsUsers[groupKey] {
 
 			// equivalent aws user of google user on the fly
 			log.WithField("email:", googleUser.PrimaryEmail).Debug("aws.FindUserByEmail() finding user")
@@ -479,11 +499,17 @@ func (s *syncGSuite) SyncGroupsUsers(queryGroups string, queryUsers string) erro
 	// validate groups members are equal in aws and google
 	log.Debug("validating groups members, equals in aws and google")
 	for _, awsGroup := range equalAWSGroups {
+		groupKey := getAWSGroupKey(awsGroup)
+		googleGroup := googleGroupsByEmail[groupKey]
+		if err := s.syncAWSGroupMetadata(awsGroup, googleGroup); err != nil {
+			return err
+		}
 
 		// add members of the new group
 		log := log.WithFields(log.Fields{"group": awsGroup.DisplayName})
 
-		for _, googleUser := range googleGroupsUsers[awsGroup.DisplayName] {
+		groupKey = getAWSGroupKey(awsGroup)
+		for _, googleUser := range googleGroupsUsers[groupKey] {
 
 			log.WithField("user", googleUser.PrimaryEmail).Debug("finding user")
 			awsUserFull, err := s.aws.FindUserByEmail(googleUser.PrimaryEmail)
@@ -516,7 +542,7 @@ func (s *syncGSuite) SyncGroupsUsers(queryGroups string, queryUsers string) erro
 			}
 		}
 
-		for _, awsUser := range deleteUsersFromGroup[awsGroup.DisplayName] {
+		for _, awsUser := range deleteUsersFromGroup[groupKey] {
 			log.WithField("user", awsUser.Username).Warn("removing user from group")
 			err := s.RemoveUserFromGroup(&awsUser.ID, &awsGroup.ID)
 			if err != nil {
@@ -528,26 +554,21 @@ func (s *syncGSuite) SyncGroupsUsers(queryGroups string, queryUsers string) erro
 	// delete aws groups (deleted in google)
 	log.WithField("count", len(delAWSGroups)).Debug("Starting deletion loop for aws groups deleted in google")
 	for _, awsGroup := range delAWSGroups {
+		groupKey := getAWSGroupKey(awsGroup)
 		// Double check ignore list here as a safety measure
-		if s.ignoreGroup(awsGroup.DisplayName) {
-			log.WithField("group", awsGroup.DisplayName).Debug("Skipping group deletion (on ignore list)")
+		if s.ignoreGroup(groupKey) {
+			log.WithField("group", groupKey).Debug("Skipping group deletion (on ignore list)")
 			continue
 		}
 
-		log := log.WithFields(log.Fields{"group": awsGroup.DisplayName})
-
-		log.Debug("finding group")
-		awsGroupFull, err := s.aws.FindGroupByDisplayName(awsGroup.DisplayName)
-		if err != nil {
-			return err
-		}
+		log := log.WithFields(log.Fields{"group": groupKey, "displayName": awsGroup.DisplayName})
 
 		log.Warn("deleting group")
 		_, err = identitystore.DeleteGroup(
 			context.Background(),
 			s.identityStore,
 			&s.cfg.IdentityStoreID,
-			&awsGroupFull.ID,
+			&awsGroup.ID,
 		)
 		if err != nil {
 			log.Error("deleting group")
@@ -858,7 +879,7 @@ func (s *syncGSuite) getGoogleGroupsAndUsers(queryGroups string, queryUsers stri
 	}
 
 	log.WithField("func", funcName).Debug("create gUsers")
-	gUsers := make([]*admin.User, 0)
+	gUsers = make([]*admin.User, 0)
 	for _, user := range gUniqUsers {
 		gUsers = append(gUsers, user)
 	}
@@ -895,7 +916,7 @@ func getGroupOperations(awsGroups []*interfaces.Group, googleGroups []*admin.Gro
 	googleMap := make(map[string]struct{})
 
 	for _, awsGroup := range awsGroups {
-		awsMap[awsGroup.DisplayName] = awsGroup
+		awsMap[getAWSGroupKey(awsGroup)] = awsGroup
 	}
 
 	for _, gGroup := range googleGroups {
@@ -909,20 +930,26 @@ func getGroupOperations(awsGroups []*interfaces.Group, googleGroups []*admin.Gro
 			equals = append(equals, awsMap[gGroup.Email])
 		} else {
 			log.WithField("gGroup", gGroup).Debug("add")
-			add = append(add, aws.NewGroup(gGroup.Email))
+			add = append(add, &interfaces.Group{
+				Schemas:     []string{constants.SCIMSchemaGroup},
+				DisplayName: gGroup.Name,
+				Description: gGroup.Email,
+				Members:     []string{},
+			})
 		}
 	}
 
 	// AWS Groups not found in Google
 	for _, awsGroup := range awsGroups {
-		if _, found := googleMap[awsGroup.DisplayName]; !found {
-			log.WithField("group", awsGroup.DisplayName).Debug("Group found in AWS but NOT in Google")
-			if ignoreGroup(awsGroup.DisplayName) {
-				log.WithField("group", awsGroup.DisplayName).Debug("Skipping group deletion (on ignore list)")
+		groupKey := getAWSGroupKey(awsGroup)
+		if _, found := googleMap[groupKey]; !found {
+			log.WithField("group", groupKey).Debug("Group found in AWS but NOT in Google")
+			if ignoreGroup(groupKey) {
+				log.WithField("group", groupKey).Debug("Skipping group deletion (on ignore list)")
 				continue
 			}
-			log.WithField("awsGroup", awsGroup.DisplayName).Debug("Adding group to delete list")
-			delete = append(delete, aws.NewGroup(awsGroup.DisplayName))
+			log.WithField("awsGroup", groupKey).Debug("Adding group to delete list")
+			delete = append(delete, awsGroup)
 		}
 	}
 
@@ -1195,6 +1222,57 @@ func (s *syncGSuite) includeGroup(name string) bool {
 	return exists
 }
 
+func getAWSGroupKey(group *interfaces.Group) string {
+	if group == nil {
+		return ""
+	}
+	if isEmailLike(group.Description) {
+		return group.Description
+	}
+	return group.DisplayName
+}
+
+func isEmailLike(value string) bool {
+	return strings.Contains(value, "@") && !strings.ContainsAny(value, " \t\r\n")
+}
+
+func (s *syncGSuite) syncAWSGroupMetadata(awsGroup *interfaces.Group, googleGroup *admin.Group) error {
+	if awsGroup == nil || googleGroup == nil {
+		return nil
+	}
+
+	operations := make([]identitystore_types.AttributeOperation, 0, 2)
+	if awsGroup.DisplayName != googleGroup.Name {
+		operations = append(operations, identitystore_types.AttributeOperation{
+			AttributePath:  aws_sdk.String("DisplayName"),
+			AttributeValue: aws_identitystore_document.NewLazyDocument(googleGroup.Name),
+		})
+	}
+	if awsGroup.Description != googleGroup.Email {
+		operations = append(operations, identitystore_types.AttributeOperation{
+			AttributePath:  aws_sdk.String("Description"),
+			AttributeValue: aws_identitystore_document.NewLazyDocument(googleGroup.Email),
+		})
+	}
+
+	if len(operations) == 0 {
+		return nil
+	}
+
+	_, err := s.identityStore.UpdateGroup(context.Background(), &aws_identitystore.UpdateGroupInput{
+		IdentityStoreId: &s.cfg.IdentityStoreID,
+		GroupId:         &awsGroup.ID,
+		Operations:      operations,
+	})
+	if err != nil {
+		return err
+	}
+
+	awsGroup.DisplayName = googleGroup.Name
+	awsGroup.Description = googleGroup.Email
+	return nil
+}
+
 func ConvertIdentityStoreGroupToAWSGroup(group identitystore_types.Group) *interfaces.Group {
 	log.Debug("ConvertIdentityStoreGroupToAWSGroup()")
 	if group.GroupId == nil {
@@ -1205,11 +1283,16 @@ func ConvertIdentityStoreGroupToAWSGroup(group identitystore_types.Group) *inter
 		log.WithField("group", group).Warn("ConvertIdentityStoreGroupToAWSGroup() Group has no DisplayName")
 		return nil
 	}
+	description := ""
+	if group.Description != nil {
+		description = *group.Description
+	}
 	log.WithField("groupId", *group.GroupId).WithField("displayName", *group.DisplayName).Debug("ConvertIdentityStoreGroupToAWSGroup() Group converted")
 	return &interfaces.Group{
 		ID:          *group.GroupId,
 		Schemas:     []string{constants.SCIMSchemaGroup},
 		DisplayName: *group.DisplayName,
+		Description: description,
 		Members:     []string{},
 	}
 }
@@ -1322,7 +1405,8 @@ func (s *syncGSuite) GetGroupMembershipsLists(awsGroups []*interfaces.Group, aws
 	// For every group, get the members and assign in awsGroupsUsers map
 	for _, group := range awsGroups {
 		curGroup = group
-		awsGroupsUsers[curGroup.DisplayName] = make([]*interfaces.User, 0)
+		groupKey := getAWSGroupKey(curGroup)
+		awsGroupsUsers[groupKey] = make([]*interfaces.User, 0)
 		memberships, err := identitystore.ListGroupMembershipsPager(
 			context.Background(),
 			aws_identitystore.NewListGroupMembershipsPaginator(
@@ -1350,7 +1434,7 @@ func (s *syncGSuite) GetGroupMembershipsLists(awsGroups []*interfaces.Group, aws
 		for _, user := range memberships { // For every member in the group
 			if user != nil {
 				// Append new user onto existing list of users
-				awsGroupsUsers[curGroup.DisplayName] = append(awsGroupsUsers[curGroup.DisplayName], user)
+				awsGroupsUsers[groupKey] = append(awsGroupsUsers[groupKey], user)
 			}
 		}
 
