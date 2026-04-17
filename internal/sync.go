@@ -599,6 +599,7 @@ func (s *syncGSuite) getGoogleGroupsAndUsers(queryGroups string, queryUsers stri
 	gUserDetailCache := make(map[string]*admin.User)
 	gGroupDetailCache := make(map[string]*admin.Group)
 	gUniqUsers := make(map[string]*admin.User)
+	gUniqGroups := make(map[string]*admin.Group)
 
 	log.WithFields(log.Fields{
 		"func":        funcName,
@@ -763,16 +764,24 @@ func (s *syncGSuite) getGoogleGroupsAndUsers(queryGroups string, queryUsers stri
 		return nil, nil, nil, err
 	}
 
-	filteredGoogleGroups := []*admin.Group{}
 	log.WithFields(log.Fields{
 		"func": funcName,
-	}).Info("filter groups by ignoreList")
+	}).Info("filter groups and discover sub-groups")
 
+	// We use a queue to process groups recursively if they have sub-groups
+	queue := make([]*admin.Group, 0)
 	for _, g := range gGroups {
+		queue = append(queue, g)
+	}
+
+	for len(queue) > 0 {
+		g := queue[0]
+		queue = queue[1:]
+
 		log.WithFields(log.Fields{
 			"func":  funcName,
-			"group": g,
-		}).Debug("processing group")
+			"group": g.Email,
+		}).Debug("processing group from queue")
 
 		if s.ignoreGroup(g.Email) {
 			log.WithFields(log.Fields{
@@ -781,97 +790,101 @@ func (s *syncGSuite) getGoogleGroupsAndUsers(queryGroups string, queryUsers stri
 			}).Info("ignoring group")
 			continue
 		}
-		filteredGoogleGroups = append(filteredGoogleGroups, g)
-	}
-	gGroups = filteredGoogleGroups
 
-	log.WithField("func", funcName).Info("fetch group memberships")
-	for _, g := range gGroups {
-		log.WithFields(log.Fields{
-			"func":  funcName,
-			"group": g,
-		}).Debug("processing group")
-
-		if s.ignoreGroup(g.Email) {
-			log.WithFields(log.Fields{
-				"func":     funcName,
-				"group.Id": g.Id,
-			}).Info("skipping group")
+		if _, found := gUniqGroups[g.Email]; found {
 			continue
 		}
+		gUniqGroups[g.Email] = g
 
-		log.WithField("func", funcName).Debug("fetch membership")
-		membersUsers, err := s.getGoogleUsersInGroup(g, gUserDetailCache, gGroupDetailCache)
+		log.WithField("func", funcName).Debug("fetch membership and look for sub-groups")
+		members, err := s.google.GetGroupMembers(g)
 		if err != nil {
+			log.WithFields(log.Fields{
+				"func":    funcName,
+				"GroupId": g.Id,
+				"Error":   err,
+			}).Error("failed retrieving membership")
 			return nil, nil, nil, err
 		}
 
-		// If we've not seen the user email address before add it to the list of unique users
-		// also, we need to deduplicate the list of members.
-		log.WithFields(log.Fields{
-			"func":         funcName,
-			"group.Id":     g.Id,
-			"membersUsers": membersUsers,
-		}).Debug("Process group membership")
-
-		gUniqMembers := make(map[string]*admin.User)
-		for _, m := range membersUsers {
-			log.WithFields(log.Fields{
-				"func":     funcName,
-				"group.Id": g.Id,
-				"member":   m,
-			}).Debug("Processing member")
-
-			if m == nil {
-				log.WithFields(log.Fields{
-					"func":      funcName,
-					"group.Id":  g.Id,
-					"member.Id": m.Id,
-				}).Error("nil user")
+		membersUsers := make([]*admin.User, 0)
+		for _, m := range members {
+			if m.Type == "GROUP" {
+				if subG, found := gGroupDetailCache[m.Email]; found {
+					log.WithFields(log.Fields{
+						"func":     funcName,
+						"parent":   g.Email,
+						"subgroup": m.Email,
+					}).Info("discovered sub-group")
+					queue = append(queue, subG)
+				}
 				continue
 			}
-			if _, found := gUniqUsers[m.PrimaryEmail]; !found {
-				log.WithFields(log.Fields{
-					"func":     funcName,
-					"group.Id": g.Id,
-					"member":   m.Id,
-				}).Debug("adding user to UniqueUsers")
-				gUniqUsers[m.PrimaryEmail] = gUserDetailCache[m.PrimaryEmail]
+
+			if m.Type != "USER" {
+				continue
 			}
 
-			if _, found := gUniqMembers[m.PrimaryEmail]; !found {
-				log.WithFields(log.Fields{
-					"func":     funcName,
-					"group.Id": g.Id,
-					"member":   m.Id,
-				}).Debug("adding user to group")
-				gUniqMembers[m.PrimaryEmail] = gUserDetailCache[m.PrimaryEmail]
+			// (existing user processing logic follows, but we use the precached info)
+			u, err := s.getGoogleUserFromMember(m, gUserDetailCache)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			if u != nil {
+				membersUsers = append(membersUsers, u)
 			}
 		}
 
-		log.WithFields(log.Fields{
-			"func":     funcName,
-			"group.Id": g.Id,
-		}).Debug("create gMembers")
+		// Deduplicate and store
+		gUniqMembers := make(map[string]*admin.User)
+		for _, m := range membersUsers {
+			if _, found := gUniqUsers[m.PrimaryEmail]; !found {
+				gUniqUsers[m.PrimaryEmail] = m
+			}
+			gUniqMembers[m.PrimaryEmail] = m
+		}
+
 		gMembers := make([]*admin.User, 0)
 		for _, member := range gUniqMembers {
 			gMembers = append(gMembers, member)
 		}
-		log.WithFields(log.Fields{
-			"func":     funcName,
-			"group.Id": g.Id,
-			"gMembers": gMembers,
-		}).Debug("Finished group membership")
-		gGroupsUsers[g.Name] = gMembers
+		gGroupsUsers[g.Email] = gMembers
+	}
+
+	// Rebuild gGroups from unique set
+	finalGroups := make([]*admin.Group, 0)
+	for _, g := range gUniqGroups {
+		finalGroups = append(finalGroups, g)
 	}
 
 	log.WithField("func", funcName).Debug("create gUsers")
+	gUsers := make([]*admin.User, 0)
 	for _, user := range gUniqUsers {
 		gUsers = append(gUsers, user)
 	}
 
-	log.WithField("func", funcName).Debug("Return")
-	return gGroups, gUsers, gGroupsUsers, nil
+	return finalGroups, gUsers, gGroupsUsers, nil
+}
+
+func (s *syncGSuite) getGoogleUserFromMember(m *admin.Member, userCache map[string]*admin.User) (*admin.User, error) {
+	if s.ignoreUser(m.Email) {
+		return nil, nil
+	}
+
+	if u, found := userCache[m.Email]; found {
+		return u, nil
+	}
+
+	// Caching on the fly
+	googleUsers, err := s.google.GetUsers("email="+m.Email, s.cfg.UserFilter)
+	if err != nil {
+		return nil, err
+	}
+	for _, u := range googleUsers {
+		userCache[u.PrimaryEmail] = u
+		return u, nil
+	}
+	return nil, nil
 }
 
 // getGroupOperations returns the groups of AWS that must be added, deleted and are equals
@@ -886,17 +899,17 @@ func getGroupOperations(awsGroups []*interfaces.Group, googleGroups []*admin.Gro
 	}
 
 	for _, gGroup := range googleGroups {
-		googleMap[gGroup.Name] = struct{}{}
+		googleMap[gGroup.Email] = struct{}{}
 	}
 
 	// Google Groups found and not found in AWS
 	for _, gGroup := range googleGroups {
-		if _, found := awsMap[gGroup.Name]; found {
+		if _, found := awsMap[gGroup.Email]; found {
 			log.WithField("gGroup", gGroup).Debug("equals")
-			equals = append(equals, awsMap[gGroup.Name])
+			equals = append(equals, awsMap[gGroup.Email])
 		} else {
 			log.WithField("gGroup", gGroup).Debug("add")
-			add = append(add, aws.NewGroup(gGroup.Name))
+			add = append(add, aws.NewGroup(gGroup.Email))
 		}
 	}
 
